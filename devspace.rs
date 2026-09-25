@@ -16,6 +16,9 @@ use xshell::{Shell, cmd};
 const REPO: &str = "bootc-dev/cgwalters-devspace-sandbox";
 const WORKFLOW: &str = "devspace.yml";
 const WORKFLOW_NAME: &str = "Development runner";
+/// The unprivileged account OpenSSH admits; the workflow's `runner` account
+/// holds the job's credentials and passwordless sudo.
+const SSH_USER: &str = "runner-sandbox";
 const WAIT: Duration = Duration::from_secs(180);
 
 #[derive(Parser, Debug)]
@@ -394,7 +397,7 @@ fn ssh_command(key: &Path, known_hosts: &Path, host: &str) -> Vec<String> {
         "StrictHostKeyChecking=accept-new".into(),
         "-o".into(),
         "IdentitiesOnly=yes".into(),
-        format!("runner@{host}"),
+        format!("{SSH_USER}@{host}"),
     ]
 }
 fn ssh_probe_command(key: &Path, known_hosts: &Path, host: &str) -> Vec<String> {
@@ -808,7 +811,7 @@ mod tests {
         let argv = ssh_command(&key, &dir.join("known hosts"), &hostname(7));
         assert!(argv.contains(&"StrictHostKeyChecking=accept-new".into()));
         assert!(argv.contains(&"IdentitiesOnly=yes".into()));
-        assert_eq!(argv.last().unwrap(), "runner@cgwalters-devspace-7");
+        assert_eq!(argv.last().unwrap(), "runner-sandbox@cgwalters-devspace-7");
         let probe = ssh_probe_command(&key, &dir.join("known hosts"), &hostname(7));
         assert!(probe.contains(&"BatchMode=yes".into()));
         assert!(probe.contains(&"ConnectTimeout=8".into()));
@@ -1036,7 +1039,7 @@ mod tests {
         };
         let run = |value: &serde_yaml::Value| value["run"].as_str().unwrap().to_string();
         // (step name, expected run snippets), in the order the steps must run.
-        let expected: [(&str, &[&str]); 6] = [
+        let expected: [(&str, &[&str]); 7] = [
             (
                 "Install development prerequisites",
                 &[
@@ -1058,10 +1061,25 @@ mod tests {
                 &["packages.txt | xargs sudo dnf install -y"],
             ),
             (
-                "Initialize runner configuration",
-                &["sudo -u runner -H just init"],
+                "Create the unprivileged runner-sandbox user",
+                &["sudo node scripts/setup-runner-sandbox.mjs"],
             ),
-            ("Prepare OpenSSH and keep the devspace available", &[]),
+            (
+                "Initialize runner-sandbox configuration",
+                &[
+                    "sudo -u runner-sandbox env -i HOME=/home/runner-sandbox",
+                    "just --justfile",
+                ],
+            ),
+            (
+                "Prepare OpenSSH and keep the devspace available",
+                &[
+                    "exec env \"${scrub[@]/#/--unset=}\" bash",
+                    "-exec chmod ug-s {} + && systemctl restart sshd.service",
+                    &format!("AllowUsers {SSH_USER}\n"),
+                    "AuthorizedKeysFile /etc/ssh/devspace-authorized_keys",
+                ],
+            ),
         ];
         let mut previous = None;
         for (name, snippets) in expected {
