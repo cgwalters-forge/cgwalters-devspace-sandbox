@@ -1,0 +1,27 @@
+[
+  [
+    {"type": "text", "text": "Mock run: exercising the tools, the sandbox and the redaction pass."},
+    {"type": "tool_use", "name": "Bash", "input": {"command": "git log --oneline -1 && id -un", "description": "Show the checkout's head and the user"}}
+  ],
+  [
+    {"type": "tool_use", "name": "Read", "input": {"file_path": "{workdir}/README.md", "limit": 5}}
+  ],
+  [
+    {"type": "tool_use", "name": "Bash", "input": {"command": "sudo -n true", "description": "Check for sudo (expected to fail)"}}
+  ],
+  [
+    {"type": "tool_use", "name": "Bash", "input": {"command": "curl -sS -m 10 -o /dev/null -w '%{http_code}\\n' http://169.254.169.254/", "description": "Reach the cloud metadata service (expected to fail)"}}
+  ],
+  [
+    {"type": "tool_use", "name": "Bash", "input": {"command": "printf 'mock secret: gh%s_%s\\n' p MOCKREDACTIONCANARY0123456789abcdef", "description": "Print a fake GitHub token for the redaction pass"}}
+  ],
+  [
+    {"type": "tool_use", "name": "Write", "input": {"file_path": "{workdir}/MOCK.md", "content": "Written by a mock agent run.\n"}}
+  ],
+  [
+    {"type": "tool_use", "name": "Write", "input": {"file_path": "/home/runner-sandbox/out/outcome.json", "content": "{\"tests\": [{\"command\": \"git log --oneline -1\", \"exit_code\": 0, \"duration_s\": 0}]}\n"}}
+  ],
+  [
+    {"type": "text", "text": "Done: the mock run finished."}
+  ]
+]

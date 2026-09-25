@@ -100,6 +100,36 @@ which Renovate keeps current via the shared bootc-dev configuration. The
 GitHub CLI, which the bot's tools call for every GitHub operation, comes from
 EPEL. Agent credentials are not provisioned, so `gh` is not logged in.
 
+## Agent runs
+
+`.github/workflows/agent.yml` runs an agent CLI on one task, unattended, as
+the same unprivileged `runner-sandbox` user, in its own `agent.slice`
+(`scripts/agent-lib.mjs`). The job has no `id-token` permission and no
+secrets. `scripts/agent-isolation-check.mjs` verifies before every run that
+the agent can't use sudo, read the job's environment or files, or reach the
+cloud metadata service, also from a container on the host network. Its
+network access is otherwise open for now; the plan is a proxy that sees
+requests and allows writes (`POST` and the like) only to known endpoints.
+
+Devspaces and agent runs are for public repositories only: their logs and
+transcripts are public. `scripts/public-repo.mjs` refuses a target that
+GitHub doesn't confirm is public, failing closed, before anything is cloned
+and again before anything is uploaded (`scripts/check-uploads.mjs`).
+
+The condensed transcript streams into the job log in an `agent (condensed)`
+group, a summary table goes to the step summary, and the `agent-run` (90
+days) and `agent-transcript` (30 days) artifacts hold the rest, redacted by
+`agent/redact.mjs` and checked for anything secret-shaped before upload. The
+files and the dispatch inputs follow the
+[agent runs contract](https://github.com/cgwalters-bot/homegit/blob/main/docs/devspace-agent-runs.md),
+and homegit's `bot-runs` dispatches and reads the runs.
+
+Inference is a mock for now: `agent/mock-model.py` serves the Messages API
+locally and replays `agent/mock-conversation.json`, so a run needs no
+credentials. Only Claude Code is wired up, driven through its own CLI; the
+plan is a generic wrapper speaking the
+[Agent Client Protocol](https://agentclientprotocol.com) instead.
+
 ## TODO / roadmap
 
 - Move the `runner-sandbox` setup into
