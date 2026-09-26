@@ -126,9 +126,23 @@ and homegit's `bot-runs` dispatches and reads the runs.
 
 Inference is a mock for now: `agent/mock-model.py` serves the Messages API
 locally and replays `agent/mock-conversation.json`, so a run needs no
-credentials. Only Claude Code is wired up, driven through its own CLI; the
-plan is a generic wrapper speaking the
-[Agent Client Protocol](https://agentclientprotocol.com) instead.
+credentials.
+
+The `harness` input picks how the agent is driven. `cli`, the default, runs
+Claude Code through its own CLI. `acp` runs `bot-harness` (`harness/`), a
+client of the [Agent Client Protocol](https://agentclientprotocol.com) on
+the `agent-client-protocol` crate, so no agent is hardcoded: it starts any
+agent in `harness/agents.toml` (Claude Code through its ACP adapter, or
+opencode) as `runner-sandbox`. It records the protocol stream, both
+directions, as `acp.jsonl` in the transcript, answers the agent's permission
+requests from `harness/policy.toml` (recording each decision and its rule),
+and cancels the session at the timeout or when the agent goes over budget:
+the cost it reports, or a number of tool calls. `bot-harness summary` then
+writes `summary.json` from the recording, so both agents give the same
+summary. With the mock, opencode gets a `mock` provider using the AI SDK's
+Anthropic client. The harness lives here, next to `agent.yml`, until the
+[task harness design](https://gist.github.com/cgwalters-bot/290d1fbd3545e430f7717948caab260f)
+settles where tasks and their tools belong.
 
 ## TODO / roadmap
 

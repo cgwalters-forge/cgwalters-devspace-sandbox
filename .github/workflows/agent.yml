@@ -27,6 +27,11 @@ on:
         type: choice
         options: ["claude", "opencode"]
         default: claude
+      harness:
+        description: "How to drive the agent: its own CLI (claude only), or bot-harness over ACP"
+        type: choice
+        options: ["cli", "acp"]
+        default: cli
       model:
         description: "Model name (empty: the agent's default)"
         type: string
@@ -100,6 +105,14 @@ jobs:
           sudo dnf install -y git jq curl python3 zstd podman nodejs npm
           grep -vE '^\s*(#|$)' npm.txt | xargs -r sudo npm install -g --no-audit --no-fund
 
+      - name: Build bot-harness
+        if: ${{ inputs.harness == 'acp' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo dnf install -y cargo
+          cargo build --release --locked -p bot-harness
+
       # Logs and transcripts are public, so private repositories are refused
       # (as they are by bot-runs dispatch), before anything is cloned.
       - name: Check that the target repository is public
@@ -126,6 +139,7 @@ jobs:
           REPO: ${{ inputs.repo }}
           BASE: ${{ inputs.base }}
           AGENT: ${{ inputs.agent }}
+          HARNESS: ${{ inputs.harness }}
           MODEL: ${{ inputs.model }}
           CORES: ${{ inputs.cores }}
           TIMEOUT_MINUTES: ${{ inputs.timeout }}
