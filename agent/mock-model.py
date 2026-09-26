@@ -11,7 +11,11 @@ blocks as the Messages API returns them ({"type": "text", "text": ...} or
 number of assistant messages it already carries, so the replay needs no
 state and follows the agent through tool results; past the end, the model
 says it's done. "{workdir}" in a tool input string becomes --workdir, since
-file tools want absolute paths. Requests without tools (titles, summaries and other side
+file tools want absolute paths. The script uses Claude Code's tool names
+and input keys (Bash, file_path); for an agent whose tools are named
+differently (opencode: bash, filePath), a scripted call goes to the offered
+tool of the same name up to case, with its keys in camelCase where that's
+what the tool's schema has. Requests without tools (titles, summaries and other side
 calls) get a short text answer. Every request is logged, one JSON line with
 its token counts, to --usage-log.
 
@@ -49,12 +53,31 @@ def expand(value, workdir):
     return value
 
 
-def prepare(blocks, workdir):
+def camel(key):
+    head, *rest = key.split("_")
+    return head + "".join(word.title() for word in rest)
+
+
+def adapt(block, tools):
+    """Fits a scripted tool call to the agent's own tool of that name."""
+    names = {t.get("name") for t in tools}
+    if block["name"] in names:
+        return block
+    tool = next((t for t in tools if str(t.get("name", "")).lower() == block["name"].lower()), None)
+    if tool is None:
+        return block
+    props = tool.get("input_schema", {}).get("properties", {})
+    inputs = {(camel(k) if k not in props and camel(k) in props else k): v for k, v in block["input"].items()}
+    return dict(block, name=tool["name"], input=inputs)
+
+
+def prepare(blocks, workdir, tools):
     out = []
     for block in blocks:
         block = dict(block)
         if block.get("type") == "tool_use":
             block["input"] = expand(block["input"], workdir)
+            block = adapt(block, tools)
             block.setdefault("id", "toolu_mock_" + uuid.uuid4().hex[:16])
         out.append(block)
     return out
@@ -103,7 +126,7 @@ class Handler(BaseHTTPRequestHandler):
         if not request.get("tools"):
             blocks, stop = [{"type": "text", "text": SIDE_CALL_TEXT}], "end_turn"
         elif turn < len(script):
-            blocks = prepare(script[turn], self.server.workdir)
+            blocks = prepare(script[turn], self.server.workdir, request["tools"])
             stop = "tool_use" if any(b["type"] == "tool_use" for b in blocks) else "end_turn"
         else:
             blocks, stop = [{"type": "text", "text": DONE_TEXT}], "end_turn"
