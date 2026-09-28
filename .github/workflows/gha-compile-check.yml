@@ -1,0 +1,31 @@
+# Fails when a compiled .lock.yml doesn't match its gha-compile source, or
+# when a source that must be rejected compiles.
+name: gha-compile check
+
+on:
+  push:
+    branches: [bot/gha-compile]
+  pull_request:
+    paths: ["gha-compile/**", ".github/workflows/*.lock.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      NICKEL_VERSION: 1.18.0
+      NICKEL_SHA256: 9cba4dd65ae9915ec61f73033aafcff307a377665a83fd8f530df086763318cb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install nickel
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/nickel" "https://github.com/nickel-lang/nickel/releases/download/$NICKEL_VERSION/nickel-x86_64-linux"
+          echo "$NICKEL_SHA256  $RUNNER_TEMP/nickel" | sha256sum -c
+          chmod +x "$RUNNER_TEMP/nickel"
+      - name: Check lock files
+        run: NICKEL="$RUNNER_TEMP/nickel" node gha-compile/compile.mjs --check
