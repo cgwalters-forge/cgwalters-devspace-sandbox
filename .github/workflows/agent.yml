@@ -9,8 +9,10 @@ run-name: "agent ${{ inputs.item }} ${{ inputs.repo }}"
 # The agents are the scripted fake one (harness/src/bin/fake-acp-agent.rs),
 # which needs no inference, and opencode, which gets it from the praxis
 # credential broker on the tailnet (vars.PRAXIS_BASE_URL). The broker holds
-# the subscription login, so no model credential reaches this runner; the
-# only credential the job uses is its OIDC token, for the tailnet login.
+# the subscription login, so no model credential reaches this runner. The
+# job's only credentials are its OIDC tokens, for the tailnet login and to
+# register a praxis run (agent/praxis.mjs), which caps and counts the
+# agent's tokens; the agent gets only that run's token.
 on:
   workflow_dispatch:
     inputs:
@@ -47,9 +49,13 @@ on:
         type: string
         default: "120"
       budget:
-        description: "Spend cap in AIC (1 AIC = $0.01)"
+        description: "Spend cap in AIC (1 AIC = $0.01), for agents with priced inference"
         type: string
         default: "500"
+      max_tokens:
+        description: "Token cap for inference through praxis (empty: the broker's per-run cap; can only lower it)"
+        type: string
+        default: ""
       workflow:
         description: "What the item wants"
         type: choice
@@ -62,9 +68,11 @@ on:
 
 permissions:
   contents: read
-  # Only for the tailnet login, as in devspace.yml: the OAuth client trusts
-  # this job's OIDC tokens. runner-sandbox can't read the step
-  # environments that hold the request token (the isolation check).
+  # For the tailnet login, as in devspace.yml (the OAuth client trusts this
+  # job's OIDC tokens), and to register the praxis run. GitHub puts the
+  # request credentials (ACTIONS_ID_TOKEN_REQUEST_URL and _TOKEN) in every
+  # step's environment; runner-sandbox starts without them and can't read
+  # the steps' environments (the isolation check proves both).
   id-token: write
 
 concurrency:
@@ -86,6 +94,7 @@ jobs:
         env:
           TIMEOUT: ${{ inputs.timeout }}
           BUDGET: ${{ inputs.budget }}
+          MAX_TOKENS: ${{ inputs.max_tokens }}
           AGENT: ${{ inputs.agent }}
         run: |
           set -euo pipefail
@@ -95,6 +104,10 @@ jobs:
           fi
           if ! [[ "$BUDGET" =~ ^(0|[1-9][0-9]{0,5})(\.[0-9]+)?$ ]]; then
             echo "::error::budget must be a number of AIC, not '$BUDGET'"
+            exit 1
+          fi
+          if ! [[ "$MAX_TOKENS" =~ ^([1-9][0-9]{0,11})?$ ]]; then
+            echo "::error::max_tokens must be empty or a positive number of tokens, not '$MAX_TOKENS'"
             exit 1
           fi
           if [[ "$AGENT" != fake && -z "$PRAXIS_BASE_URL" ]]; then
@@ -188,9 +201,44 @@ jobs:
         shell: bash
         run: sudo node scripts/setup-runner-sandbox.mjs ${PRAXIS_BASE_URL:+--tailnet-allow "$PRAXIS_BASE_URL"}
 
+      # The broker admits only requests with the token of a run registered
+      # with an OIDC token from this workflow; the token lands in a
+      # directory of runner's, and is masked in the log. A broker not set
+      # up for that fails the run here: there is no unregistered fallback.
+      # Registered as late as possible, so the build and setup don't use
+      # up the run's lifetime (the agent's timeout plus a grace period).
+      - name: Register the run with praxis
+        if: ${{ inputs.agent != 'fake' }}
+        shell: bash
+        env:
+          TIMEOUT_MINUTES: ${{ inputs.timeout }}
+          MAX_TOKENS: ${{ inputs.max_tokens }}
+          PRAXIS_DIR: ${{ runner.temp }}/praxis
+        run: node agent/praxis.mjs register "$PRAXIS_DIR"
+
+      # The run token, as the key in runner-sandbox's opencode configuration
+      # (0600): the only way it reaches the agent.
+      - name: Configure the agent's inference
+        if: ${{ inputs.agent == 'opencode' }}
+        shell: bash
+        env:
+          PRAXIS_DIR: ${{ runner.temp }}/praxis
+        run: node agent/praxis.mjs configure "$PRAXIS_DIR"
+
       - name: Check the runner-sandbox user's isolation
         shell: bash
-        run: node scripts/agent-isolation-check.mjs ${PRAXIS_BASE_URL:+--tailnet-allow "$PRAXIS_BASE_URL"} https://github.com/
+        env:
+          PRAXIS_DIR: ${{ runner.temp }}/praxis
+          AGENT: ${{ inputs.agent }}
+        run: |
+          set -euo pipefail
+          # Every agent but the fake one has a run token (registration fails
+          # closed), so its checks always run for them.
+          token_args=()
+          if [[ "$AGENT" != fake ]]; then
+            token_args=(--run-token-file "$PRAXIS_DIR/run-token")
+          fi
+          node scripts/agent-isolation-check.mjs ${PRAXIS_BASE_URL:+--tailnet-allow "$PRAXIS_BASE_URL"} "${token_args[@]}" https://github.com/
 
       - name: Run the agent
         id: agent
@@ -208,13 +256,30 @@ jobs:
           WORKFLOW: ${{ inputs.workflow }}
           BRIEF: ${{ inputs.brief }}
           OUT: ${{ runner.temp }}/agent
+          PRAXIS_DIR: ${{ runner.temp }}/praxis
         run: node agent/run.mjs
+
+      # run.mjs ends the run itself to put its usage in summary.json; this
+      # makes sure its token is dead whatever happened to that step, and
+      # nothing is uploaded unless it succeeded: redaction only catches the
+      # token's plain form, so no upload may happen while it still works.
+      - name: End the praxis run
+        id: end
+        if: ${{ always() && inputs.agent != 'fake' }}
+        shell: bash
+        env:
+          PRAXIS_DIR: ${{ runner.temp }}/praxis
+        run: |
+          node agent/praxis.mjs finish "$PRAXIS_DIR" || {
+            echo "::error::the praxis run wasn't confirmed ended, so nothing of this run is uploaded"
+            exit 1
+          }
 
       # Nothing is uploaded unless this passes, even when the agent failed:
       # the target is still public, and nothing secret-shaped is left.
       - name: Check the uploads
         id: uploads
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && (inputs.agent == 'fake' || steps.end.outcome == 'success') }}
         shell: bash
         env:
           REPO: ${{ inputs.repo }}
