@@ -107,6 +107,12 @@ jobs:
           [[ "$SSH_PUBLIC_KEY" =~ ^ssh-ed25519[[:space:]]+[A-Za-z0-9+/]+={0,2}([[:space:]][^[:cntrl:]]*)?$ ]]
           [[ "$(getenforce)" == Enforcing ]]
           duration_seconds=$((DURATION_MINUTES * 60))
+          # The soft deadline: the devspace stays up until then, and SSH
+          # sessions see it (and when it started) as epoch seconds, so
+          # tools on either end can tell how long is left without knowing
+          # this workflow's inputs or its timeout-minutes.
+          started=$(date +%s)
+          deadline=$((started + duration_seconds))
           config=$(mktemp)
           key_input=$(mktemp)
           authorized_key=/home/runner/.ssh/devspace-authorized_keys
@@ -144,6 +150,7 @@ jobs:
           PermitTunnel no
           X11Forwarding no
           PermitUserEnvironment no
+          SetEnv DEVSPACE_STARTED=$started DEVSPACE_DEADLINE=$deadline
           UsePAM yes
           StrictModes yes
           EOF
@@ -165,8 +172,7 @@ jobs:
           health_check
           printf 'OpenSSH is ready for runner@%s\n' "$(hostname --fqdn)"
           printf 'Tailscale IPv4: %s\n' "$tailscale_ip"
-          started=$(date +%s)
-          while (( $(date +%s) - started < duration_seconds )); do
+          while (( $(date +%s) < deadline )); do
             health_check
             sudo tailscale status --self
             sleep 5
