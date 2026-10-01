@@ -390,6 +390,164 @@ jobs:
         fs.writeFileSync("/proc/sys/kernel/yama/ptrace_scope", "1\n");
       shell: sudo node {0}
     - env:
+        RUNNER_SANDBOX_EGRESS_JS: |
+          // The sandbox's egress proxy: an HTTP proxy that the enter step
+          // (install.cjs) starts as a systemd unit with a dynamic user, and the only
+          // way out of the host for the sandbox user, whose other traffic nftables
+          // rejects. It forwards plain HTTP requests and tunnels CONNECT only to the
+          // hosts `sandbox.network.allow` lists, on ports 80 and 443, resolving the
+          // names itself so that the sandbox's own DNS can stay closed.
+          //
+          //   node egress-proxy.cjs CONFIG.json   CONFIG: {listen: {host, port}, allow: [pattern]}
+          //
+          // A pattern is a host name (`crates.io`, that host only) or `*.` and a
+          // host name (`*.githubusercontent.com`, its subdomains only). IP literals
+          // are refused, and so are names that resolve to loopback, link-local
+          // (the cloud metadata service) or unspecified addresses.
+          "use strict";
+          const fs = require("node:fs");
+          const http = require("node:http");
+          const net = require("node:net");
+          const dns = require("node:dns/promises");
+
+          // Lowercase DNS names of two or more labels whose last label starts with a
+          // letter, so no IPv4 literal; `*.` only as the first label. The compiler
+          // (lib/gha.ncl, src/shape.rs) holds the allowlist to the same pattern.
+          const PATTERN_RE = /^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$/;
+          const PORTS = new Set([80, 443]);
+          const CONNECT_TIMEOUT_MS = 30_000;
+
+          // The host in a request, lowercased and without a trailing dot, or null
+          // if it isn't a DNS name (an IP literal, say).
+          function normalize(host) {
+            const h = String(host).toLowerCase().replace(/\.$/, "");
+            if (net.isIP(h) || h.startsWith("[")) return null;
+            return PATTERN_RE.test(h) && !h.startsWith("*.") ? h : null;
+          }
+
+          function allowed(host, allow) {
+            const h = normalize(host);
+            if (!h) return false;
+            return allow.some((p) => (p.startsWith("*.") ? h.endsWith(p.slice(1)) : h === p));
+          }
+
+          // Addresses no allowed name may lead to: the host itself and the link
+          // (where the cloud metadata service and Azure's wireserver live).
+          function forbiddenAddress(addr) {
+            const v4 = addr.startsWith("::ffff:") && net.isIPv4(addr.slice(7)) ? addr.slice(7) : addr;
+            if (net.isIPv4(v4)) {
+              const [a, b] = v4.split(".").map(Number);
+              return a === 0 || a === 127 || (a === 169 && b === 254) || v4 === "168.63.129.16";
+            }
+            const a = addr.toLowerCase();
+            return a === "::" || a === "::1" || /^fe[89ab]/.test(a) || a.startsWith("fd00:ec2:");
+          }
+
+          async function resolve(host) {
+            const addrs = (await dns.lookup(host, { all: true, verbatim: true })).map((r) => r.address);
+            const ok = addrs.filter((a) => !forbiddenAddress(a));
+            if (!ok.length) throw new Error(`${host} resolves only to forbidden addresses (${addrs.join(", ")})`);
+            return ok[0];
+          }
+
+          // `host:port` from a CONNECT request target, or null.
+          function splitTarget(target) {
+            const m = /^([^:[\]]+):([0-9]{1,5})$/.exec(target ?? "");
+            return m ? { host: m[1], port: Number(m[2]) } : null;
+          }
+
+          function serve(config, { quiet = false } = {}) {
+            const allow = config.allow;
+            const say = quiet ? () => {} : console.log;
+            const log = (verdict, host, port, why = "") => say(`${verdict} ${host}:${port}${why ? ` (${why})` : ""}`);
+            const check = (host, port) => {
+              if (!PORTS.has(port)) return `port ${port} is not 80 or 443`;
+              if (!allowed(host, allow)) return "not in sandbox.network.allow";
+              return null;
+            };
+
+            const server = http.createServer(async (req, res) => {
+              let url;
+              try {
+                url = new URL(req.url);
+              } catch {
+                res.writeHead(400).end("egress proxy: only absolute http:// URLs\n");
+                return;
+              }
+              const port = Number(url.port || 80);
+              const denied = url.protocol !== "http:" ? "only http:// requests (https goes through CONNECT)" : check(url.hostname, port);
+              if (denied) {
+                log("DENY", url.hostname, port, denied);
+                res.writeHead(403).end(`egress proxy: ${url.hostname}:${port}: ${denied}\n`);
+                return;
+              }
+              let addr;
+              try {
+                addr = await resolve(url.hostname);
+              } catch (e) {
+                log("DENY", url.hostname, port, e.message);
+                res.writeHead(502).end(`egress proxy: ${e.message}\n`);
+                return;
+              }
+              log("ALLOW", url.hostname, port);
+              const headers = { ...req.headers };
+              delete headers["proxy-connection"];
+              delete headers["proxy-authorization"];
+              const up = http.request({ host: addr, port, method: req.method, path: url.pathname + url.search, headers });
+              up.on("response", (r) => {
+                res.writeHead(r.statusCode ?? 502, r.headers);
+                r.pipe(res);
+              });
+              up.on("error", (e) => res.headersSent ? res.destroy() : res.writeHead(502).end(`egress proxy: ${e.message}\n`));
+              req.pipe(up);
+            });
+
+            server.on("connect", async (req, client, head) => {
+              const t = splitTarget(req.url);
+              const host = t?.host ?? String(req.url);
+              const port = t?.port ?? 0;
+              const denied = t ? check(t.host, t.port) : "not host:port";
+              const refuse = (status, why) => {
+                log("DENY", host, port, why);
+                client.end(`HTTP/1.1 ${status}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\negress proxy: ${host}:${port}: ${why}\n`);
+              };
+              if (denied) return refuse("403 Forbidden", denied);
+              let addr;
+              try {
+                addr = await resolve(t.host);
+              } catch (e) {
+                return refuse("502 Bad Gateway", e.message);
+              }
+              const up = net.connect({ host: addr, port: t.port, timeout: CONNECT_TIMEOUT_MS });
+              let established = false;
+              up.once("connect", () => {
+                established = true;
+                up.setTimeout(0);
+                log("ALLOW", host, port);
+                client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+                if (head?.length) up.write(head);
+                up.pipe(client);
+                client.pipe(up);
+              });
+              up.once("timeout", () => up.destroy(new Error("connect timed out")));
+              up.on("error", (e) => (established ? client.destroy() : refuse("502 Bad Gateway", e.message)));
+              client.on("error", () => up.destroy());
+            });
+            server.on("clientError", (_e, socket) => socket.destroy());
+            server.listen(config.listen.port, config.listen.host, () =>
+              say(`egress proxy on ${config.listen.host}:${server.address().port}, allowing ${allow.length ? allow.join(", ") : "nothing"}`));
+            return server;
+          }
+
+          module.exports = { PATTERN_RE, allowed, forbiddenAddress, splitTarget, serve };
+
+          if (require.main === module) {
+            const config = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+            for (const p of config.allow) {
+              if (!PATTERN_RE.test(p)) throw new Error(`invalid sandbox.network.allow entry ${JSON.stringify(p)}`);
+            }
+            serve(config);
+          }
         RUNNER_SANDBOX_EXEC_JS: |
           // Runner side of a sandboxed step, used as its shell
           // (`shell: /usr/local/bin/runner-sandbox-exec {0}`). It runs as the runner
@@ -1201,6 +1359,12 @@ jobs:
             RUNNER_TOOL_CACHE: CONFIG.toolcache,
             RUNNER_OS: "Linux",
             RUNNER_ARCH,
+            // The egress proxy, in every spelling tools read; Node's own fetch
+            // reads it only with NODE_USE_ENV_PROXY.
+            ...(CONFIG.proxy ? {
+              http_proxy: CONFIG.proxy, https_proxy: CONFIG.proxy, HTTP_PROXY: CONFIG.proxy, HTTPS_PROXY: CONFIG.proxy,
+              no_proxy: "localhost,127.0.0.1,::1", NO_PROXY: "localhost,127.0.0.1,::1", NODE_USE_ENV_PROXY: "1",
+            } : {}),
             ...(action ? { GITHUB_ACTION_PATH: action.dir, GITHUB_ACTION_REPOSITORY: action.repository, GITHUB_ACTION_REF: action.ref } : {}),
             ...Object.fromEntries(Object.entries(FILES).map(([f, name]) => [name, path.join(outDir, f)])),
           };
@@ -1288,6 +1452,10 @@ jobs:
             "workspace": "tracked"
           },
           "lockRunnerSudo": true,
+          "network": {
+            "allow": [],
+            "unrestricted": false
+          },
           "user": "runner-sandbox",
           "workspace": "${{ github.workspace }}"
         };
@@ -1297,7 +1465,8 @@ jobs:
         // wrapper as RUNNER_SANDBOX_EXEC_JS and RUNNER_SANDBOX_RUN_JS, the
         // workspace hand-off (handoff.cjs) as RUNNER_SANDBOX_HANDOFF_JS, and the
         // file command parser and step launcher they use as
-        // RUNNER_SANDBOX_FILECMD_JS and RUNNER_SANDBOX_LAUNCH_JS.
+        // RUNNER_SANDBOX_FILECMD_JS and RUNNER_SANDBOX_LAUNCH_JS, and the egress
+        // proxy as RUNNER_SANDBOX_EGRESS_JS.
         //
         // It creates the sandbox user, hands it the workspace, installs
         // the two halves of the step wrapper, and (with CONFIG.lockRunnerSudo) takes
@@ -1318,6 +1487,19 @@ jobs:
         const FILECMD = "/usr/local/libexec/runner-sandbox-filecmd.cjs";
         const LAUNCHER = "/usr/local/libexec/runner-sandbox-launch";
         const DOCKER_UNITS = ["docker.socket", "docker.service", "containerd.service"];
+        // The egress proxy (egress-proxy.cjs), the sandbox's only way out unless
+        // sandbox.network.unrestricted.
+        const EGRESS_PROXY = "/usr/local/libexec/runner-sandbox-egress-proxy.cjs";
+        const EGRESS_CONFIG = `${CONFIG_DIR}/egress.json`;
+        const EGRESS_UNIT = "runner-sandbox-egress";
+        const EGRESS_HOST = "127.0.0.1";
+        const EGRESS_PORT = 3128;
+        const NFT_TABLE = "runner_sandbox_egress";
+        // systemd-resolved answers any local user over D-Bus and varlink, which no
+        // packet filter sees: a way to send names (data) to any DNS server.
+        const RESOLVED_BUS_NAME = "org.freedesktop.resolve1";
+        const RESOLVED_VARLINK = "/run/systemd/resolve/io.systemd.Resolve";
+        const DBUS_POLICY = "/etc/dbus-1/system.d/zz-runner-sandbox.conf";
 
         function run(cmd, args, { check = true } = {}) {
           const r = spawnSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] });
@@ -1385,7 +1567,85 @@ jobs:
           fs.chownSync(d, sandbox.uid, sandbox.gid);
         }
 
-        fs.writeFileSync(`${CONFIG_DIR}/config.json`, JSON.stringify({ user, ...sandbox, workdir: WORKDIR, tempdir: TEMPDIR, toolcache: TOOLCACHE, runnerHome }), { mode: 0o644 });
+        // The sandbox's uid and its subordinate uids (rootless containers), as
+        // nftables ranges.
+        function sandboxUids() {
+          const ranges = [`${sandbox.uid}`];
+          const subuid = fs.existsSync("/etc/subuid") ? fs.readFileSync("/etc/subuid", "utf8") : "";
+          for (const line of subuid.split("\n")) {
+            const [owner, start, count] = line.trim().split(":");
+            if ((owner === user || owner === `${sandbox.uid}`) && Number(count) > 0) {
+              ranges.push(`${Number(start)}-${Number(start) + Number(count) - 1}`);
+            }
+          }
+          return ranges;
+        }
+
+        // Whether `user` (root if null) can open a TCP connection to host:port.
+        function canConnect(host, port, asUser = null) {
+          const probe = ["bash", "-c", 'exec 3<>"/dev/tcp/$0/$1"', host, `${port}`];
+          const cmd = asUser ? ["runuser", "-u", asUser, "--", "timeout", "10", ...probe] : ["timeout", "10", ...probe];
+          return spawnSync(cmd[0], cmd.slice(1), { stdio: "ignore" }).status === 0;
+        }
+
+        // Default deny for the sandbox user: its packets may go to this host
+        // (where the proxy listens), never to DNS, and nowhere else; the proxy,
+        // another user, goes out for it to the allowed hosts only. The runner and
+        // root keep their network as it was.
+        function restrictEgress(allow) {
+          for (const tool of ["nft", "systemd-run"]) {
+            if (run("sh", ["-c", `command -v ${tool}`], { check: false }).status !== 0) {
+              throw new Error(`${tool} not found: sandbox.network needs it (or set sandbox.network.unrestricted = true)`);
+            }
+          }
+          if (canConnect(EGRESS_HOST, EGRESS_PORT)) throw new Error(`${EGRESS_HOST}:${EGRESS_PORT}, the egress proxy's port, is already taken`);
+          fs.writeFileSync(EGRESS_PROXY, process.env.RUNNER_SANDBOX_EGRESS_JS ?? "", { mode: 0o644 });
+          fs.writeFileSync(EGRESS_CONFIG, JSON.stringify({ listen: { host: EGRESS_HOST, port: EGRESS_PORT }, allow }), { mode: 0o644 });
+          run("systemd-run", [`--unit=${EGRESS_UNIT}`, "--property=DynamicUser=yes", "--property=ProtectSystem=strict",
+            "--property=ProtectHome=yes", "--property=PrivateTmp=yes", "--property=NoNewPrivileges=yes",
+            fs.realpathSync(process.execPath), EGRESS_PROXY, EGRESS_CONFIG]);
+          for (let i = 0; !canConnect(EGRESS_HOST, EGRESS_PORT); i++) {
+            if (i >= 50) throw new Error(`the egress proxy didn't start listening; see journalctl -u ${EGRESS_UNIT}`);
+            spawnSync("sleep", ["0.2"]);
+          }
+          const ruleset = `table inet ${NFT_TABLE} {
+          chain output {
+            type filter hook output priority filter; policy accept;
+            meta skuid { ${sandboxUids().join(", ")} } jump sandbox
+          }
+          chain sandbox {
+            meta l4proto { tcp, udp } th dport 53 counter reject
+            oif "lo" accept
+            meta l4proto tcp counter reject with tcp reset
+            counter reject with icmpx admin-prohibited
+          }
+        }
+        `;
+          const nft = spawnSync("nft", ["-f", "-"], { input: ruleset, encoding: "utf8", stdio: ["pipe", "inherit", "inherit"] });
+          if (nft.status !== 0) throw new Error(`nft -f failed (exit ${nft.status}) on:\n${ruleset}`);
+          if (fs.existsSync(path.dirname(DBUS_POLICY))) {
+            fs.writeFileSync(DBUS_POLICY, `<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+         "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+        <busconfig>
+          <policy user="${user}">
+            <deny send_destination="${RESOLVED_BUS_NAME}"/>
+          </policy>
+        </busconfig>
+        `, { mode: 0o644 });
+            run("busctl", ["call", "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ReloadConfig"]);
+          }
+          if (fs.existsSync(RESOLVED_VARLINK)) run("setfacl", ["-m", `u:${user}:---`, RESOLVED_VARLINK]);
+          // Fail closed: the sandbox must not get out on its own.
+          for (const [host, port] of [["1.1.1.1", 443], ["8.8.8.8", 53]]) {
+            if (canConnect(host, port, user)) throw new Error(`${user} still reaches ${host}:${port} directly after the egress rules`);
+          }
+          console.log(`Restricted ${user}'s egress to the proxy at ${EGRESS_HOST}:${EGRESS_PORT}, allowing ${allow.length ? allow.join(", ") : "nothing"}`);
+          return `http://${EGRESS_HOST}:${EGRESS_PORT}`;
+        }
+        const proxy = CONFIG.network.unrestricted ? null : restrictEgress(CONFIG.network.allow);
+        if (!proxy) console.log(`sandbox.network.unrestricted: ${user}'s egress is open`);
+
+        fs.writeFileSync(`${CONFIG_DIR}/config.json`, JSON.stringify({ user, ...sandbox, workdir: WORKDIR, tempdir: TEMPDIR, toolcache: TOOLCACHE, runnerHome, proxy }), { mode: 0o644 });
         // runner-sandbox-run runs as root under this node, through the one sudo
         // rule runner keeps, so the binary and every directory above it must be
         // root's alone: a runner-owned node, as in a tool cache, would give runner
@@ -1452,7 +1712,7 @@ jobs:
         }
         console.log(`Entered the sandbox: later run steps execute as ${user} (uid ${sandbox.uid}) in ${WORKDIR}`);
         console.log(run("sudo", ["-l", "-U", runner]).stdout);
-      shell: sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS,RUNNER_SANDBOX_FILECMD_JS,RUNNER_SANDBOX_LAUNCH_JS node {0}
+      shell: sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS,RUNNER_SANDBOX_FILECMD_JS,RUNNER_SANDBOX_LAUNCH_JS,RUNNER_SANDBOX_EGRESS_JS node {0}
     - env:
         AGENT: fake
         AGENTS: /etc/agent-share/agent-agents.toml
@@ -2065,6 +2325,164 @@ jobs:
         fs.writeFileSync("/proc/sys/kernel/yama/ptrace_scope", "1\n");
       shell: sudo node {0}
     - env:
+        RUNNER_SANDBOX_EGRESS_JS: |
+          // The sandbox's egress proxy: an HTTP proxy that the enter step
+          // (install.cjs) starts as a systemd unit with a dynamic user, and the only
+          // way out of the host for the sandbox user, whose other traffic nftables
+          // rejects. It forwards plain HTTP requests and tunnels CONNECT only to the
+          // hosts `sandbox.network.allow` lists, on ports 80 and 443, resolving the
+          // names itself so that the sandbox's own DNS can stay closed.
+          //
+          //   node egress-proxy.cjs CONFIG.json   CONFIG: {listen: {host, port}, allow: [pattern]}
+          //
+          // A pattern is a host name (`crates.io`, that host only) or `*.` and a
+          // host name (`*.githubusercontent.com`, its subdomains only). IP literals
+          // are refused, and so are names that resolve to loopback, link-local
+          // (the cloud metadata service) or unspecified addresses.
+          "use strict";
+          const fs = require("node:fs");
+          const http = require("node:http");
+          const net = require("node:net");
+          const dns = require("node:dns/promises");
+
+          // Lowercase DNS names of two or more labels whose last label starts with a
+          // letter, so no IPv4 literal; `*.` only as the first label. The compiler
+          // (lib/gha.ncl, src/shape.rs) holds the allowlist to the same pattern.
+          const PATTERN_RE = /^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$/;
+          const PORTS = new Set([80, 443]);
+          const CONNECT_TIMEOUT_MS = 30_000;
+
+          // The host in a request, lowercased and without a trailing dot, or null
+          // if it isn't a DNS name (an IP literal, say).
+          function normalize(host) {
+            const h = String(host).toLowerCase().replace(/\.$/, "");
+            if (net.isIP(h) || h.startsWith("[")) return null;
+            return PATTERN_RE.test(h) && !h.startsWith("*.") ? h : null;
+          }
+
+          function allowed(host, allow) {
+            const h = normalize(host);
+            if (!h) return false;
+            return allow.some((p) => (p.startsWith("*.") ? h.endsWith(p.slice(1)) : h === p));
+          }
+
+          // Addresses no allowed name may lead to: the host itself and the link
+          // (where the cloud metadata service and Azure's wireserver live).
+          function forbiddenAddress(addr) {
+            const v4 = addr.startsWith("::ffff:") && net.isIPv4(addr.slice(7)) ? addr.slice(7) : addr;
+            if (net.isIPv4(v4)) {
+              const [a, b] = v4.split(".").map(Number);
+              return a === 0 || a === 127 || (a === 169 && b === 254) || v4 === "168.63.129.16";
+            }
+            const a = addr.toLowerCase();
+            return a === "::" || a === "::1" || /^fe[89ab]/.test(a) || a.startsWith("fd00:ec2:");
+          }
+
+          async function resolve(host) {
+            const addrs = (await dns.lookup(host, { all: true, verbatim: true })).map((r) => r.address);
+            const ok = addrs.filter((a) => !forbiddenAddress(a));
+            if (!ok.length) throw new Error(`${host} resolves only to forbidden addresses (${addrs.join(", ")})`);
+            return ok[0];
+          }
+
+          // `host:port` from a CONNECT request target, or null.
+          function splitTarget(target) {
+            const m = /^([^:[\]]+):([0-9]{1,5})$/.exec(target ?? "");
+            return m ? { host: m[1], port: Number(m[2]) } : null;
+          }
+
+          function serve(config, { quiet = false } = {}) {
+            const allow = config.allow;
+            const say = quiet ? () => {} : console.log;
+            const log = (verdict, host, port, why = "") => say(`${verdict} ${host}:${port}${why ? ` (${why})` : ""}`);
+            const check = (host, port) => {
+              if (!PORTS.has(port)) return `port ${port} is not 80 or 443`;
+              if (!allowed(host, allow)) return "not in sandbox.network.allow";
+              return null;
+            };
+
+            const server = http.createServer(async (req, res) => {
+              let url;
+              try {
+                url = new URL(req.url);
+              } catch {
+                res.writeHead(400).end("egress proxy: only absolute http:// URLs\n");
+                return;
+              }
+              const port = Number(url.port || 80);
+              const denied = url.protocol !== "http:" ? "only http:// requests (https goes through CONNECT)" : check(url.hostname, port);
+              if (denied) {
+                log("DENY", url.hostname, port, denied);
+                res.writeHead(403).end(`egress proxy: ${url.hostname}:${port}: ${denied}\n`);
+                return;
+              }
+              let addr;
+              try {
+                addr = await resolve(url.hostname);
+              } catch (e) {
+                log("DENY", url.hostname, port, e.message);
+                res.writeHead(502).end(`egress proxy: ${e.message}\n`);
+                return;
+              }
+              log("ALLOW", url.hostname, port);
+              const headers = { ...req.headers };
+              delete headers["proxy-connection"];
+              delete headers["proxy-authorization"];
+              const up = http.request({ host: addr, port, method: req.method, path: url.pathname + url.search, headers });
+              up.on("response", (r) => {
+                res.writeHead(r.statusCode ?? 502, r.headers);
+                r.pipe(res);
+              });
+              up.on("error", (e) => res.headersSent ? res.destroy() : res.writeHead(502).end(`egress proxy: ${e.message}\n`));
+              req.pipe(up);
+            });
+
+            server.on("connect", async (req, client, head) => {
+              const t = splitTarget(req.url);
+              const host = t?.host ?? String(req.url);
+              const port = t?.port ?? 0;
+              const denied = t ? check(t.host, t.port) : "not host:port";
+              const refuse = (status, why) => {
+                log("DENY", host, port, why);
+                client.end(`HTTP/1.1 ${status}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\negress proxy: ${host}:${port}: ${why}\n`);
+              };
+              if (denied) return refuse("403 Forbidden", denied);
+              let addr;
+              try {
+                addr = await resolve(t.host);
+              } catch (e) {
+                return refuse("502 Bad Gateway", e.message);
+              }
+              const up = net.connect({ host: addr, port: t.port, timeout: CONNECT_TIMEOUT_MS });
+              let established = false;
+              up.once("connect", () => {
+                established = true;
+                up.setTimeout(0);
+                log("ALLOW", host, port);
+                client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+                if (head?.length) up.write(head);
+                up.pipe(client);
+                client.pipe(up);
+              });
+              up.once("timeout", () => up.destroy(new Error("connect timed out")));
+              up.on("error", (e) => (established ? client.destroy() : refuse("502 Bad Gateway", e.message)));
+              client.on("error", () => up.destroy());
+            });
+            server.on("clientError", (_e, socket) => socket.destroy());
+            server.listen(config.listen.port, config.listen.host, () =>
+              say(`egress proxy on ${config.listen.host}:${server.address().port}, allowing ${allow.length ? allow.join(", ") : "nothing"}`));
+            return server;
+          }
+
+          module.exports = { PATTERN_RE, allowed, forbiddenAddress, splitTarget, serve };
+
+          if (require.main === module) {
+            const config = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+            for (const p of config.allow) {
+              if (!PATTERN_RE.test(p)) throw new Error(`invalid sandbox.network.allow entry ${JSON.stringify(p)}`);
+            }
+            serve(config);
+          }
         RUNNER_SANDBOX_EXEC_JS: |
           // Runner side of a sandboxed step, used as its shell
           // (`shell: /usr/local/bin/runner-sandbox-exec {0}`). It runs as the runner
@@ -2876,6 +3294,12 @@ jobs:
             RUNNER_TOOL_CACHE: CONFIG.toolcache,
             RUNNER_OS: "Linux",
             RUNNER_ARCH,
+            // The egress proxy, in every spelling tools read; Node's own fetch
+            // reads it only with NODE_USE_ENV_PROXY.
+            ...(CONFIG.proxy ? {
+              http_proxy: CONFIG.proxy, https_proxy: CONFIG.proxy, HTTP_PROXY: CONFIG.proxy, HTTPS_PROXY: CONFIG.proxy,
+              no_proxy: "localhost,127.0.0.1,::1", NO_PROXY: "localhost,127.0.0.1,::1", NODE_USE_ENV_PROXY: "1",
+            } : {}),
             ...(action ? { GITHUB_ACTION_PATH: action.dir, GITHUB_ACTION_REPOSITORY: action.repository, GITHUB_ACTION_REF: action.ref } : {}),
             ...Object.fromEntries(Object.entries(FILES).map(([f, name]) => [name, path.join(outDir, f)])),
           };
@@ -2961,6 +3385,10 @@ jobs:
             "workspace": "none"
           },
           "lockRunnerSudo": true,
+          "network": {
+            "allow": [],
+            "unrestricted": false
+          },
           "user": "runner-sandbox",
           "workspace": "${{ github.workspace }}"
         };
@@ -2970,7 +3398,8 @@ jobs:
         // wrapper as RUNNER_SANDBOX_EXEC_JS and RUNNER_SANDBOX_RUN_JS, the
         // workspace hand-off (handoff.cjs) as RUNNER_SANDBOX_HANDOFF_JS, and the
         // file command parser and step launcher they use as
-        // RUNNER_SANDBOX_FILECMD_JS and RUNNER_SANDBOX_LAUNCH_JS.
+        // RUNNER_SANDBOX_FILECMD_JS and RUNNER_SANDBOX_LAUNCH_JS, and the egress
+        // proxy as RUNNER_SANDBOX_EGRESS_JS.
         //
         // It creates the sandbox user, hands it the workspace, installs
         // the two halves of the step wrapper, and (with CONFIG.lockRunnerSudo) takes
@@ -2991,6 +3420,19 @@ jobs:
         const FILECMD = "/usr/local/libexec/runner-sandbox-filecmd.cjs";
         const LAUNCHER = "/usr/local/libexec/runner-sandbox-launch";
         const DOCKER_UNITS = ["docker.socket", "docker.service", "containerd.service"];
+        // The egress proxy (egress-proxy.cjs), the sandbox's only way out unless
+        // sandbox.network.unrestricted.
+        const EGRESS_PROXY = "/usr/local/libexec/runner-sandbox-egress-proxy.cjs";
+        const EGRESS_CONFIG = `${CONFIG_DIR}/egress.json`;
+        const EGRESS_UNIT = "runner-sandbox-egress";
+        const EGRESS_HOST = "127.0.0.1";
+        const EGRESS_PORT = 3128;
+        const NFT_TABLE = "runner_sandbox_egress";
+        // systemd-resolved answers any local user over D-Bus and varlink, which no
+        // packet filter sees: a way to send names (data) to any DNS server.
+        const RESOLVED_BUS_NAME = "org.freedesktop.resolve1";
+        const RESOLVED_VARLINK = "/run/systemd/resolve/io.systemd.Resolve";
+        const DBUS_POLICY = "/etc/dbus-1/system.d/zz-runner-sandbox.conf";
 
         function run(cmd, args, { check = true } = {}) {
           const r = spawnSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] });
@@ -3058,7 +3500,85 @@ jobs:
           fs.chownSync(d, sandbox.uid, sandbox.gid);
         }
 
-        fs.writeFileSync(`${CONFIG_DIR}/config.json`, JSON.stringify({ user, ...sandbox, workdir: WORKDIR, tempdir: TEMPDIR, toolcache: TOOLCACHE, runnerHome }), { mode: 0o644 });
+        // The sandbox's uid and its subordinate uids (rootless containers), as
+        // nftables ranges.
+        function sandboxUids() {
+          const ranges = [`${sandbox.uid}`];
+          const subuid = fs.existsSync("/etc/subuid") ? fs.readFileSync("/etc/subuid", "utf8") : "";
+          for (const line of subuid.split("\n")) {
+            const [owner, start, count] = line.trim().split(":");
+            if ((owner === user || owner === `${sandbox.uid}`) && Number(count) > 0) {
+              ranges.push(`${Number(start)}-${Number(start) + Number(count) - 1}`);
+            }
+          }
+          return ranges;
+        }
+
+        // Whether `user` (root if null) can open a TCP connection to host:port.
+        function canConnect(host, port, asUser = null) {
+          const probe = ["bash", "-c", 'exec 3<>"/dev/tcp/$0/$1"', host, `${port}`];
+          const cmd = asUser ? ["runuser", "-u", asUser, "--", "timeout", "10", ...probe] : ["timeout", "10", ...probe];
+          return spawnSync(cmd[0], cmd.slice(1), { stdio: "ignore" }).status === 0;
+        }
+
+        // Default deny for the sandbox user: its packets may go to this host
+        // (where the proxy listens), never to DNS, and nowhere else; the proxy,
+        // another user, goes out for it to the allowed hosts only. The runner and
+        // root keep their network as it was.
+        function restrictEgress(allow) {
+          for (const tool of ["nft", "systemd-run"]) {
+            if (run("sh", ["-c", `command -v ${tool}`], { check: false }).status !== 0) {
+              throw new Error(`${tool} not found: sandbox.network needs it (or set sandbox.network.unrestricted = true)`);
+            }
+          }
+          if (canConnect(EGRESS_HOST, EGRESS_PORT)) throw new Error(`${EGRESS_HOST}:${EGRESS_PORT}, the egress proxy's port, is already taken`);
+          fs.writeFileSync(EGRESS_PROXY, process.env.RUNNER_SANDBOX_EGRESS_JS ?? "", { mode: 0o644 });
+          fs.writeFileSync(EGRESS_CONFIG, JSON.stringify({ listen: { host: EGRESS_HOST, port: EGRESS_PORT }, allow }), { mode: 0o644 });
+          run("systemd-run", [`--unit=${EGRESS_UNIT}`, "--property=DynamicUser=yes", "--property=ProtectSystem=strict",
+            "--property=ProtectHome=yes", "--property=PrivateTmp=yes", "--property=NoNewPrivileges=yes",
+            fs.realpathSync(process.execPath), EGRESS_PROXY, EGRESS_CONFIG]);
+          for (let i = 0; !canConnect(EGRESS_HOST, EGRESS_PORT); i++) {
+            if (i >= 50) throw new Error(`the egress proxy didn't start listening; see journalctl -u ${EGRESS_UNIT}`);
+            spawnSync("sleep", ["0.2"]);
+          }
+          const ruleset = `table inet ${NFT_TABLE} {
+          chain output {
+            type filter hook output priority filter; policy accept;
+            meta skuid { ${sandboxUids().join(", ")} } jump sandbox
+          }
+          chain sandbox {
+            meta l4proto { tcp, udp } th dport 53 counter reject
+            oif "lo" accept
+            meta l4proto tcp counter reject with tcp reset
+            counter reject with icmpx admin-prohibited
+          }
+        }
+        `;
+          const nft = spawnSync("nft", ["-f", "-"], { input: ruleset, encoding: "utf8", stdio: ["pipe", "inherit", "inherit"] });
+          if (nft.status !== 0) throw new Error(`nft -f failed (exit ${nft.status}) on:\n${ruleset}`);
+          if (fs.existsSync(path.dirname(DBUS_POLICY))) {
+            fs.writeFileSync(DBUS_POLICY, `<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+         "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+        <busconfig>
+          <policy user="${user}">
+            <deny send_destination="${RESOLVED_BUS_NAME}"/>
+          </policy>
+        </busconfig>
+        `, { mode: 0o644 });
+            run("busctl", ["call", "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ReloadConfig"]);
+          }
+          if (fs.existsSync(RESOLVED_VARLINK)) run("setfacl", ["-m", `u:${user}:---`, RESOLVED_VARLINK]);
+          // Fail closed: the sandbox must not get out on its own.
+          for (const [host, port] of [["1.1.1.1", 443], ["8.8.8.8", 53]]) {
+            if (canConnect(host, port, user)) throw new Error(`${user} still reaches ${host}:${port} directly after the egress rules`);
+          }
+          console.log(`Restricted ${user}'s egress to the proxy at ${EGRESS_HOST}:${EGRESS_PORT}, allowing ${allow.length ? allow.join(", ") : "nothing"}`);
+          return `http://${EGRESS_HOST}:${EGRESS_PORT}`;
+        }
+        const proxy = CONFIG.network.unrestricted ? null : restrictEgress(CONFIG.network.allow);
+        if (!proxy) console.log(`sandbox.network.unrestricted: ${user}'s egress is open`);
+
+        fs.writeFileSync(`${CONFIG_DIR}/config.json`, JSON.stringify({ user, ...sandbox, workdir: WORKDIR, tempdir: TEMPDIR, toolcache: TOOLCACHE, runnerHome, proxy }), { mode: 0o644 });
         // runner-sandbox-run runs as root under this node, through the one sudo
         // rule runner keeps, so the binary and every directory above it must be
         // root's alone: a runner-owned node, as in a tool cache, would give runner
@@ -3125,7 +3645,7 @@ jobs:
         }
         console.log(`Entered the sandbox: later run steps execute as ${user} (uid ${sandbox.uid}) in ${WORKDIR}`);
         console.log(run("sudo", ["-l", "-U", runner]).stdout);
-      shell: sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS,RUNNER_SANDBOX_FILECMD_JS,RUNNER_SANDBOX_LAUNCH_JS node {0}
+      shell: sudo --preserve-env=RUNNER_SANDBOX_EXEC_JS,RUNNER_SANDBOX_RUN_JS,RUNNER_SANDBOX_HANDOFF_JS,RUNNER_SANDBOX_FILECMD_JS,RUNNER_SANDBOX_LAUNCH_JS,RUNNER_SANDBOX_EGRESS_JS node {0}
     - name: Check the proposals
       run: node /etc/agent-share/safe-outputs-validate.cjs /etc/agent-share/safe-outputs-lib.cjs /etc/agent-share/safe-outputs-config.json /etc/agent-share/safe-outputs-proposals validated
       shell: /usr/local/bin/runner-sandbox-exec {0}
