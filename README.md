@@ -47,6 +47,8 @@ workflow's 270-minute timeout allows setup plus the full four-hour lifetime.
 Use `--cores 4`, `--cores 16` (the default), or `--cores 64` to select a runner
 size. The runner is disposable: do not store secrets on it.
 `runner-sizes.json` records the corresponding runner labels.
+SSH sessions get `DEVSPACE_DEADLINE`, the time (epoch seconds) the runner
+goes away, and `DEVSPACE_STARTED`, when that duration started.
 
 If dispatch cannot be correlated, the CLI retains the pending private key and
 identifies its session so the run can be located manually.
