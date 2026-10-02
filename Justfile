@@ -32,3 +32,9 @@ init:
     chmod -R go-w "$homegit" "$HOME/.local/bin"
     (cd "$homegit/dotfiles" && find . -mindepth 1 ! -type l -print0) | (cd "$HOME" && xargs -0 chmod go-w --)
     find "$HOME" -maxdepth 1 -name '.*' ! -type l -perm /go+w -exec chmod go-w {} +
+
+# The harness's and the agent scripts' tests, and the egress policy's.
+test:
+    cargo test --workspace --locked
+    node --test agent/*.test.mjs scripts/*.test.mjs
+    cd agent/egress && python3 -m unittest -v test_policy
