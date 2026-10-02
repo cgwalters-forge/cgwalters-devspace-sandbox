@@ -61,6 +61,12 @@ on:
         description: "The task text (public: no private data)"
         type: string
         required: true
+      # DROP: spike only.
+      spike_broker:
+        description: "DROP: xenon (vars.PRAXIS_BASE_URL) or a synthetic praxis#12 broker on this runner"
+        type: choice
+        options: ["xenon", "synthetic"]
+        default: xenon
 
 permissions:
   contents: read
@@ -188,6 +194,57 @@ jobs:
           cargo build --release --locked -p bot-harness
           sudo install -m 0755 target/release/fake-acp-agent /usr/local/bin/
 
+      # DROP: spike only. praxis-credential-broker#12 at a pinned commit,
+      # with its synthetic Codex provider and an opencode-capable mock
+      # upstream (spike/mock.py), on this runner's own tailnet address,
+      # trusting GitHub's real OIDC keys for this workflow and repository.
+      - name: "DROP: Start a synthetic praxis#12 broker on this runner"
+        if: ${{ inputs.agent != 'fake' && inputs.spike_broker == 'synthetic' }}
+        shell: bash
+        env:
+          PRAXIS_COMMIT: b26df0581e941ad0b102feb2750f523c9bc4a643
+        run: |
+          set -euo pipefail
+          src=$RUNNER_TEMP/praxis-src
+          git clone -q https://github.com/cgwalters-bot/praxis-credential-broker "$src"
+          git -C "$src" fetch -q origin pull/12/head
+          git -C "$src" checkout -q "$PRAXIS_COMMIT"
+          (cd "$src"
+           podman build -q --pull=missing -f Containerfile.proxy --build-arg CARGO_FEATURES=synthetic-test -t localhost/praxis-credential-proxy:test .
+           podman build -q --pull=missing -f Containerfile.synthetic-agent -t localhost/praxis-provider-codex:synthetic .
+           podman build -q --pull=missing -f Containerfile.mock -t localhost/praxis-mock-upstream:dev .
+           podman build -q --pull=missing -f Containerfile.gateway -t localhost/praxis-gateway:test .)
+          cfg=$RUNNER_TEMP/praxis-cfg
+          mkdir -p "$cfg"
+          printf '{"workflows": ["%s"], "repository_ids": [%s]}\n' "$GITHUB_WORKFLOW_REF" "$GITHUB_REPOSITORY_ID" >"$cfg/run-token-policy.yaml"
+          cp spike/mock.py "$cfg/mock.py"
+          chmod -R a+rX "$cfg"
+          cat "$cfg/run-token-policy.yaml"
+          printf '%s' synthetic-agent-channel-012345678901234567890123 | podman secret create chan - >/dev/null
+          printf '%s' sk-ant-oat01-SYNTHETIC-SPIKE-TOKEN-0123456789abcdef | podman secret create anth - >/dev/null
+          ip=$(sudo tailscale ip -4)
+          podman volume create sock >/dev/null
+          podman pod create --name praxis --publish "$ip:18080:8081" >/dev/null
+          common=(--pod praxis --user 65532:65532 --read-only --cap-drop=ALL --security-opt=no-new-privileges)
+          podman create "${common[@]}" --name praxis-proxy --env CLIENT_AUTH_MODE=disabled \
+            --secret chan,target=/run/secrets/channel/agent-channel-key,uid=65532,gid=65532,mode=0400 \
+            --volume sock:/run/praxis-credentials:Z --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+            localhost/praxis-credential-proxy:test >/dev/null
+          podman create "${common[@]}" --name praxis-agent \
+            --secret chan,target=/run/secrets/channel/agent-channel-key,uid=65532,gid=65532,mode=0400 \
+            --volume sock:/run/praxis-credentials:Z localhost/praxis-provider-codex:synthetic >/dev/null
+          podman create "${common[@]}" --name praxis-gw --no-healthcheck \
+            --secret anth,target=/run/secrets/anthropic/oauth-token,uid=65532,gid=65532,mode=0400 \
+            --volume "$cfg/run-token-policy.yaml:/etc/praxis-credential-broker/run-token-policy.yaml:ro,Z" \
+            localhost/praxis-gateway:test >/dev/null
+          podman create "${common[@]}" --name praxis-mock --volume "$cfg/mock.py:/mock-upstream.py:ro,Z" \
+            localhost/praxis-mock-upstream:dev >/dev/null
+          podman pod start praxis >/dev/null
+          for _ in $(seq 60); do curl -fs "http://$ip:18080/healthz" >/dev/null && break; sleep 1; done
+          curl -fsS "http://$ip:18080/healthz"
+          echo "unregistered POST /v1/runs: $(curl -s -o /dev/null -w '%{http_code}' -X POST "http://$ip:18080/v1/runs")"
+          echo "PRAXIS_BASE_URL=http://$ip:18080/v1" >>"$GITHUB_ENV"
+
       - name: Create the unprivileged runner-sandbox user
         shell: bash
         run: sudo node scripts/setup-runner-sandbox.mjs ${PRAXIS_BASE_URL:+--tailnet-allow "$PRAXIS_BASE_URL"}
@@ -267,6 +324,11 @@ jobs:
             echo "::error::the praxis run wasn't confirmed ended, so nothing of this run is uploaded"
             exit 1
           }
+
+      - name: "DROP: The synthetic broker's usage lines"
+        if: ${{ always() && inputs.spike_broker == 'synthetic' }}
+        shell: bash
+        run: podman logs praxis-gw 2>&1 | grep -E 'run usage|request usage|registered|refus' | tail -n 40 || true
 
       # Nothing is uploaded unless this passes, even when the agent failed:
       # the target is still public, and nothing secret-shaped is left.
