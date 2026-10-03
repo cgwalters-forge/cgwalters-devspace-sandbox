@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,9 @@ const REPO: &str = "bootc-dev/cgwalters-devspace-sandbox";
 const WORKFLOW: &str = "devspace.yml";
 const WORKFLOW_NAME: &str = "Development runner";
 const WAIT: Duration = Duration::from_secs(180);
+/// A fresh run can queue for a runner and then install the toolchain and
+/// dotfiles before sshd starts, so `start` waits longer than `ssh` does.
+const START_WAIT: Duration = Duration::from_secs(900);
 
 #[derive(Parser, Debug)]
 #[command(about = "Manage disposable development runners.")]
@@ -27,7 +30,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum CommandLine {
-    /// Dispatch a disposable development runner.
+    /// Dispatch a disposable development runner and wait until SSH is ready.
     Start(StartArgs),
     /// List active workflow-dispatched development runners.
     List,
@@ -474,6 +477,33 @@ fn ssh_probe(key: &Path, known_hosts: &Path, host: &str) -> Result<bool> {
     }
 }
 
+/// Poll until ordinary SSH to the run accepts `key`, failing early if the
+/// workflow ends. Returns the interactive ssh command line.
+fn wait_for_ssh(id: u64, key: &Path, timeout: Duration) -> Result<Vec<String>> {
+    let known_hosts = key
+        .parent()
+        .context("managed key has no parent directory")?
+        .join("known_hosts");
+    if !known_hosts.exists() {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&known_hosts)?;
+    }
+    chmod(&known_hosts, 0o600)?;
+    let host = hostname(id);
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        ensure_active(id)?;
+        if ssh_probe(key, &known_hosts, &host)? {
+            return Ok(ssh_command(key, &known_hosts, &host));
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+    bail!("ordinary SSH for workflow {id} was not ready before timeout")
+}
+
 fn command_start(args: StartArgs) -> Result<()> {
     let sizes = runner_sizes()?;
     if !sizes.contains_key(&args.cores.to_string()) {
@@ -554,6 +584,11 @@ fn command_start(args: StartArgs) -> Result<()> {
                 )
             })?;
             println!("Run {id}: {}", run.url);
+            io::stdout().flush().context("flushing run details")?;
+            wait_for_ssh(id, &destination.join("id_ed25519"), START_WAIT).with_context(|| {
+                format!("run {id} was started; retry `cargo devspace ssh {id}` or stop it")
+            })?;
+            println!("SSH is ready: cargo devspace ssh {id}");
             return Ok(());
         }
         thread::sleep(Duration::from_secs(2));
@@ -578,30 +613,8 @@ fn command_ssh(args: RunArgs) -> Result<()> {
             args.run_id
         );
     }
-    let known_hosts = key.parent().unwrap().join("known_hosts");
-    if !known_hosts.exists() {
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&known_hosts)?;
-    }
-    chmod(&known_hosts, 0o600)?;
-    let host = hostname(args.run_id);
-    let deadline = Instant::now() + WAIT;
-    while Instant::now() < deadline {
-        ensure_active(args.run_id)?;
-        if ssh_probe(&key, &known_hosts, &host)? {
-            let command = ssh_command(&key, &known_hosts, &host);
-            return Err(Command::new(&command[0]).args(&command[1..]).exec())
-                .context("execing ssh");
-        }
-        thread::sleep(Duration::from_secs(2));
-    }
-    bail!(
-        "ordinary SSH for workflow {} was not ready before timeout",
-        args.run_id
-    )
+    let command = wait_for_ssh(args.run_id, &key, WAIT)?;
+    Err(Command::new(&command[0]).args(&command[1..]).exec()).context("execing ssh")
 }
 fn remove_state(id: u64) -> Result<()> {
     let path = state_path(id)?;
